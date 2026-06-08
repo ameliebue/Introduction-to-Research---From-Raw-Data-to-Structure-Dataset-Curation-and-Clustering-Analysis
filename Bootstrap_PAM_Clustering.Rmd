@@ -1,0 +1,1334 @@
+---
+title: 'Bootstrap PAM Clustering with Gower Distance: Cleaned vs. Preprocessed Dataset'
+author: "Amelie Büscher"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center"
+)
+```
+
+
+
+# Why Bootstrap PAM with Gower Distance was selected
+
+
+## Why Other Clustering Methods Were Not Suitable
+Before selecting the final clustering approach, several common clustering methods were considered. However, not all of them were appropriate for the structure and size of our dataset.
+
+### Why K-Means Was Not Suitable
+K-Means is one of the most widely used clustering algorithms, but it is designed mainly for purely numeric data and relies on Euclidean distance. This creates several problems for our dataset:
+
+1. Our data contains mostly ordinal and binary variables, not continuous numeric variables.
+2. K-Means calculates cluster centres using arithmetic means. For categorical or ordinal survey variables, these means are often not meaningful.
+3. Euclidean distance assumes equal numerical spacing between values, which is not appropriate for many survey-type variables.
+
+Because of these limitations, K-Means would produce clusters that are difficult to interpret and statistically questionable for this type of data.
+
+
+### Why PAM Was More Appropriate
+Instead of K-Means, we considered PAM (Partitioning Around Medoids).
+PAM is more suitable for mixed and ordinal datasets because:
+
+- it uses medoids (real observations from the dataset) instead of artificial mean-based cluster centres,
+- it can work together with Gower distance, which supports binary, ordinal, nominal, and numeric variables
+- and it is more robust to outliers and non-Euclidean data structures.
+#### Why PAM was not applied on the full dataset
+Although PAM is theoretically appropriate, applying standard PAM directly to the full dataset is computationally difficult.
+PAM requires the calculation of a complete pairwise distance matrix. With approximately 37 000 observations, this would require several gigabytes of memory and extremely long computation times. On standard hardware, this becomes impractical.
+For these reasons, PAM is methodologically much better suited for our survey data than K-Means.
+
+
+### Why CLARA was not selected
+To overcome the computational limitations of PAM, we initially considered CLARA (Clustering Large Applications).
+CLARA is essentially an extension of PAM designed for large datasets. Instead of clustering the full dataset, it:
+
+1. draws random subsamples,
+2. runs PAM on these smaller samples,
+3. and selects the best clustering solution.
+
+This makes CLARA computationally efficient and suitable for large datasets.
+However, CLARA introduced a methodological problem for our specific research question.
+
+#### The Problem with CLARA for Our Comparison
+The goal of this analysis is to compare:
+
+- the cleaned dataset and
+- the preprocessed dataset.
+
+Both datasets contain the same individuals but differ in preprocessing steps.
+The issue with CLARA is that every run draws a different random sample from the data. Therefore, if one dataset achieves a higher silhouette score, it becomes unclear whether:
+
+- preprocessing actually improved the clustering structure, or
+- the algorithm simply happened to draw a more "cluster-friendly" sample.
+
+This introduces additional sampling noise into the comparison.
+
+
+
+## Why finally Bootstrap PAM was selected
+To solve this problem, we implemented a Bootstrap PAM procedure.
+The central idea is that both datasets always use exactly the same sampled individuals in each iteration.
+The procedure works as follows:
+
+1. Draw one bootstrap sample of row indices (with replacement).
+2. Apply the exact same indices to both datasets.
+3. Compute Gower distance matrices.
+4. Run PAM clustering on both subsets.
+5. Compute and store the silhouette scores.
+6. Repeat the process B times.
+
+This approach combines the advantages of PAM with a statistically cleaner comparison framework:
+- PAM remains suitable for mixed and ordinal data, 
+- Gower distance correctly handles different variable types,
+- memory usage stays manageable because clustering is performed only on smaller bootstrap samples,
+- and both datasets are evaluated on identical persons in every iteration.
+
+As a result, any systematic difference in silhouette scores can be attributed much more confidently to the preprocessing itself rather than to random sampling variation.
+
+> **Why not just draw separate samples of the same size?**
+> Even if both samples have 500 rows, they would contain *different* persons. One
+> sample might by chance contain more "easy-to-cluster" respondents and produce a
+> higher silhouette score for reasons that have nothing to do with preprocessing. Using
+> the same indices eliminates this source of noise entirely.
+
+
+
+## Why GOWER Distance was used
+The clustering procedure uses Gower distance because the dataset contains different variable types.
+Gower distance:
+
+- supports binary, ordinal, nominal, and numeric variables simultaneously,
+- normalises variables to a common 0–1 scale,
+- and prevents variables with larger scales from dominating the distance calculation.
+
+This makes it especially appropriate for survey and questionnaire data.
+
+
+
+## Why Multiple Bootstrap Iterations Are Necessary
+A single clustering result can always be influenced by random sampling effects. Therefore, the procedure is repeated multiple times.
+By running the bootstrap procedure repeatedly, we obtain a distribution of silhouette scores rather than a single value. This allows us to evaluate:
+
+- the average clustering quality,
+- the variability of the results,
+- and the stability of the comparison between datasets.
+
+If similar results are obtained across repeated bootstrap samples, the clustering solution can be considered more stable and less dependent on random variation.
+
+
+
+## Why the choice of B matters
+An important methodological question concerns the number of bootstrap iterations, denoted by B.
+If B is chosen too small, the estimated silhouette scores may still be strongly influenced by random sampling variation. In this case, the observed differences between datasets may not be reliable.
+Increasing B improves the stability of the estimates because the clustering results are averaged over a larger number of bootstrap samples. Larger values of B therefore reduce random fluctuations and lead to more robust conclusions.
+However, increasing B also increases computational costs because PAM clustering and Gower distance calculations must be repeated for every iteration.
+For this reason, bootstrap analyses typically use moderate to large values such as:
+
+- B = 100 for an initial stability assessment,
+- B = 500 for more reliable estimation,
+- or B = 1000 when highly stable results are required.
+
+To evaluate whether the conclusions depend on the selected number of iterations, the bootstrap procedure is repeated for several values of B. If the mean silhouette scores and statistical conclusions remain similar across different values of B, the results can be considered stable.
+
+> **In other words:** increasing B serves a similar purpose as increasing sample size in statistical analysis: the goal is to reduce random variation and improve the reliability of the conclusions.
+
+
+# Setup: Load Libraries and Settings
+
+```{r load-libraries}
+library(tidyverse)   
+library(cluster)     
+library(RColorBrewer)
+```
+
+```{r settings}
+set.seed(42)
+
+# --- Settings ---
+
+# Range of k values to evaluate for each dataset (2 to 8).
+K_VALUES <- 2:8
+
+# Number of pilot bootstrap samples used to evaluate each k.
+# Using more repetitions here gives us a proper distribution per k, not just a mean.
+K_REPS <- 30
+
+# Sample size for the pilot k-selection step (smaller = faster).
+PILOT_N <- 300
+
+# Values of B to test in the stability analysis.
+B_values <- c(25, 50, 100, 200)
+
+# Main B for the detailed analysis.
+B_main <- 200
+
+# Sample size per bootstrap run.
+SAMPLE_N <- 500
+
+# Colour scheme used throughout all plots.
+dataset_colors <- c("Cleaned" = "#2C7BB6", "Preprocessed" = "#D7191C")
+```
+
+
+
+# Step 1: Load the Data
+
+```{r load-data}
+dataset_cleaned      <- read_csv("Dataset_Cleaned.csv")
+dataset_preprocessed <- read_csv("Dataset_Preprocessed.csv")
+
+cat("Cleaned dataset:     ", nrow(dataset_cleaned), "rows,",
+    ncol(dataset_cleaned), "columns\n")
+cat("Preprocessed dataset:", nrow(dataset_preprocessed), "rows,",
+    ncol(dataset_preprocessed), "columns\n")
+```
+
+
+
+# Step 2: Assign Correct Data Types
+
+Gower distance handles mixed data automatically, but only if the variables have the
+correct R data type:
+
+- **Ordered factor** → treated as ordinal (uses rank difference)
+- **Factor** → treated as nominal (uses 0/1 match)
+- **Numeric** → treated as continuous (uses range-normalised difference)
+
+```{r assign-types}
+binary_vars  <- c("acchome", "accwrk", "accmove", "accoth", "accnone")
+ordinal_vars <- c("fampref", "famadvs", "fampdf",
+                  "mcclose", "mcinter", "mccoord", "mcpriv", "mcmsinf")
+nominal_vars <- c("livpnt")
+numeric_vars <- c("chldo12")
+
+assign_types <- function(df) {
+  df %>%
+    mutate(
+      across(any_of(binary_vars), ~ factor(., levels = c(0, 1))),
+      across(any_of(ordinal_vars), ~ factor(
+        as.character(.),
+        ordered = TRUE,
+        levels  = as.character(sort(unique(as.numeric(as.character(.)))))
+      )),
+      across(any_of(nominal_vars), ~ factor(as.character(.))),
+      across(any_of(numeric_vars), ~ as.numeric(as.character(.)))
+    ) %>%
+    drop_na()
+}
+
+cleaned_typed      <- assign_types(dataset_cleaned)
+preprocessed_typed <- assign_types(
+  dataset_preprocessed %>%
+    mutate(mc_perception_index = as.numeric(mc_perception_index))
+)
+
+cat("After type assignment and dropping NAs:\n")
+cat("Cleaned:     ", nrow(cleaned_typed), "rows\n")
+cat("Preprocessed:", nrow(preprocessed_typed), "rows\n")
+```
+
+
+
+# Step 3: Choosing the Number of Clusters (k)
+
+Before running the main bootstrap, we need to decide **how many clusters (k)** to use.
+This is not a trivial decision: too few clusters merge groups that are genuinely
+different; too many split meaningful groups into fragments.
+
+## Method: Average Silhouette Width
+
+We use the **average silhouette width** as our criterion. For each observation, the
+silhouette width measures how well it fits its own cluster compared to the nearest
+alternative cluster. 
+Values close to +1 mean the data point clearly belongs to the right cluster. 
+Values close to 0 mean it is between two clusters. 
+Negative values mean it may be in the wrong cluster. 
+The **average** across all observations summarises overall cluster quality
+for a given k: higher is better.
+
+## Should Both Datasets Use the Same k?
+
+This is an important methodological question. There are two possible approaches:
+
+- **A shared k:** Both datasets are clustered with the same number of clusters. This
+  is required if we want to compare silhouette scores directly — otherwise we would
+  be comparing a two-cluster solution on the cleaned data with a four-cluster solution
+  on the preprocessed data, which is not a fair comparison. Our research question is
+  *"does preprocessing improve cluster quality?"* and answering it requires holding k
+  constant.
+
+- **A dataset-specific k:** Each dataset uses its own optimal k. This is appropriate
+  if the goal is to describe the best possible cluster structure for each dataset
+  independently, not to compare them on equal footing.
+
+Since our goal is a **direct comparison of clustering quality under identical
+conditions**, we use **a shared k**.
+
+## Why Paired Indices Matter Even for K-Selection
+
+A subtle but important point: if we draw **independent** pilot samples for the cleaned
+and preprocessed dataset, any observed difference in silhouette scores across k values
+could partially reflect **which persons happened to end up in each sample**, rather
+than the effect of preprocessing. For example, if the cleaned dataset pilot sample
+happens by chance to contain more homogeneous respondents, it may appear to prefer a
+lower k — not because of the data structure, but because of sampling luck.
+
+To eliminate this source of noise entirely, we use the **same row indices** for both
+datasets in every pilot run — exactly the same logic as in the main bootstrap. This
+guarantees that any difference in the silhouette curves between cleaned and preprocessed
+is caused by the preprocessing itself, not by different persons being compared.
+
+## Why Looking Only at the Mean Is Not Enough
+
+In an earlier version of this analysis, k was chosen simply by picking the value with
+the highest average silhouette width. While this is a reasonable starting point, it has
+a notable weakness: it ignores how *stable* that mean actually is across bootstrap
+samples.
+
+Imagine two values of k where k = 2 has a mean silhouette of 0.18 but with high
+variability, and k = 3 has a mean of 0.17 but very consistent scores across all
+repetitions. Selecting k = 2 purely on the basis of its slightly higher mean could be
+misleading — the apparent advantage might simply reflect that one or two lucky samples
+inflated the average. The more stable k = 3 might actually be the more trustworthy
+choice.
+
+For this reason, we now treat k-selection as a **stability and distribution problem**,
+not just a single-number comparison. Instead of collecting only the mean silhouette per
+k, we keep all individual silhouette scores from each pilot repetition and inspect
+their **full distribution** using boxplots and 95% bootstrap confidence intervals.
+
+> **Important distinction:** This distributional approach is specifically for choosing k.
+> It is completely separate from the stability check across different B values in Step 5,
+> which addresses a different question — namely, whether the *main* bootstrap result
+> depends on how many repetitions we run. The two analyses serve different purposes and
+> should not be confused with each other.
+
+## K-Selection Procedure
+
+For each candidate k (2 to 8), we draw `K_REPS` = `r K_REPS` sets of row indices of
+size `PILOT_N` = `r PILOT_N`. Each set of indices is applied to **both** datasets
+simultaneously, and PAM is run on each. We now **store all individual silhouette scores**
+(not just the mean) to allow a distributional comparison across k values.
+
+> **Why store individual scores per repetition?** A single mean per k can hide important
+> information about how variable the silhouette scores are. By keeping all scores, we
+> can visualise the full distribution for each k and make a more informed decision.
+
+```{r k-selection-function}
+# Evaluate all candidate k values using PAIRED pilot samples.
+# The same row indices are used for both datasets in every repetition.
+# We now return all individual scores per repetition, not just the mean,
+# so that we can inspect the full distribution for each k.
+eval_k_paired <- function(k_values, k_reps, pilot_n, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+
+  # We will collect a long-format data frame with one row per (k, rep, dataset)
+  results_long <- data.frame(
+    k       = integer(),
+    rep     = integer(),
+    dataset = character(),
+    sil     = numeric()
+  )
+
+  for (k in k_values) {
+    for (r in 1:k_reps) {
+      # ONE set of indices for BOTH datasets — same persons, only preprocessing differs
+      idx <- sample(nrow(cleaned_typed), size = pilot_n, replace = FALSE)
+
+      pilot_c  <- cleaned_typed[idx, ]
+      pilot_p  <- preprocessed_typed[idx, ]
+
+      gower_c  <- daisy(pilot_c, metric = "gower")
+      gower_p  <- daisy(pilot_p, metric = "gower")
+
+      pam_c    <- pam(gower_c, k = k, diss = TRUE)
+      pam_p    <- pam(gower_p, k = k, diss = TRUE)
+
+      sil_c_val <- mean(silhouette(pam_c$clustering, gower_c)[, 3])
+      sil_p_val <- mean(silhouette(pam_p$clustering, gower_p)[, 3])
+
+      results_long <- rbind(results_long,
+        data.frame(k = k, rep = r, dataset = "Cleaned",      sil = sil_c_val),
+        data.frame(k = k, rep = r, dataset = "Preprocessed", sil = sil_p_val)
+      )
+    }
+  }
+
+  results_long
+}
+```
+
+```{r k-selection-run, cache=TRUE}
+cat("Evaluating k using paired pilot samples (same indices for both datasets)...\n")
+
+k_scores_long <- eval_k_paired(K_VALUES, K_REPS, PILOT_N, seed = 42)
+
+cat("Done. Total rows collected:", nrow(k_scores_long), "\n")
+```
+
+## Results: Mean Silhouette Width per k (Summary Table)
+
+As a first overview, we compute the mean silhouette width per k. This is the same
+information as before, but now it is only the starting point — not the final basis for
+the decision.
+
+```{r k-selection-summary-table}
+k_summary <- k_scores_long %>%
+  group_by(k, dataset) %>%
+  summarise(
+    mean_sil = round(mean(sil),   4),
+    sd_sil   = round(sd(sil),     4),
+    ci_lower = round(mean(sil) - 1.96 * sd(sil) / sqrt(n()), 4),
+    ci_upper = round(mean(sil) + 1.96 * sd(sil) / sqrt(n()), 4),
+    .groups  = "drop"
+  )
+
+k_summary_wide <- k_summary %>%
+  select(k, dataset, mean_sil, sd_sil) %>%
+  pivot_wider(names_from = dataset,
+              values_from = c(mean_sil, sd_sil),
+              names_sep   = "_")
+
+knitr::kable(k_summary_wide,
+             col.names = c("k",
+                           "Mean Sil. (Cleaned)", "Mean Sil. (Preprocessed)",
+                           "SD (Cleaned)",        "SD (Preprocessed)"),
+             caption   = paste0("Average silhouette width and SD for k = ",
+                                min(K_VALUES), " to ", max(K_VALUES),
+                                " (", K_REPS, " paired pilot samples of size ",
+                                PILOT_N, "; same indices for both datasets)"))
+```
+
+The table already shows not only the mean silhouette width per k but also the standard
+deviation. A k with a high mean but also a high SD might be less reliable than one with
+a slightly lower mean but much smaller variability.
+
+## Distributional View: Boxplots Across All k Values
+
+To get a clearer picture of stability, we now look at the **full distribution** of
+silhouette scores for each k using boxplots. Each box summarises the `r K_REPS`
+individual silhouette scores obtained across all pilot repetitions.
+
+```{r k-boxplot, fig.width=10, fig.height=5}
+ggplot(k_scores_long, aes(x = factor(k), y = sil, fill = dataset)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21, outlier.size = 1.5,
+               position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = dataset_colors) +
+  labs(
+    title    = "Distribution of Pilot Silhouette Scores by k",
+    subtitle = paste0("Each box = ", K_REPS, " paired pilot runs of size ", PILOT_N,
+                      "; same row indices used for both datasets"),
+    x        = "Number of Clusters (k)",
+    y        = "Average Silhouette Width",
+    fill     = "Dataset"
+  ) +
+  theme_minimal()
+```
+
+### How to Read This Plot
+
+Each box represents the spread of silhouette scores across all pilot repetitions for
+that k. A **narrow box** means the results were consistent across samples — whatever k
+you chose, you would consistently get about the same clustering quality. A **wide box**
+means the results fluctuated a lot from sample to sample, which suggests that the
+silhouette score for that k is less reliable.
+
+We are looking for a k that combines a reasonably high median with **narrow and
+consistent boxes** on both datasets. A k that looks best on average but has a very wide
+spread is less convincing than one that is slightly lower on average but much more
+stable.
+
+## Confidence Intervals for Each k
+
+In addition to the boxplots, we compute 95% confidence intervals for the mean
+silhouette width per k. These give a formal sense of how precisely the mean is
+estimated across the pilot repetitions.
+
+```{r k-ci-plot, fig.width=10, fig.height=5}
+ggplot(k_summary, aes(x = factor(k), y = mean_sil,
+                       color = dataset, group = dataset)) +
+  geom_line(linewidth = 0.8, position = position_dodge(width = 0.4)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                width = 0.25, linewidth = 0.7,
+                position = position_dodge(width = 0.4)) +
+  scale_color_manual(values = dataset_colors) +
+  labs(
+    title    = "Mean Silhouette Width with 95% Confidence Intervals by k",
+    subtitle = paste0("Based on ", K_REPS, " paired pilot repetitions per k"),
+    x        = "Number of Clusters (k)",
+    y        = "Mean Average Silhouette Width",
+    color    = "Dataset"
+  ) +
+  theme_minimal()
+```
+
+### How to Read This Plot
+
+The error bars show the 95% confidence interval around the estimated mean silhouette
+for each k. Shorter error bars indicate that the mean was estimated more precisely —
+i.e., the pilot runs were more consistent for that k. When the confidence intervals of
+two adjacent k values overlap substantially, it is harder to argue that one is clearly
+better than the other based on the mean alone.
+
+## Choosing a Shared k Based on Stability
+
+```{r choose-shared-k}
+# Compute a combined stability score: we prefer k values where
+# (a) the mean silhouette is high, and
+# (b) the SD is low (stable across repetitions).
+# We average across both datasets for a fair shared-k decision.
+
+k_stability <- k_summary %>%
+  group_by(k) %>%
+  summarise(
+    combined_mean = mean(mean_sil),   # average silhouette across both datasets
+    combined_sd   = mean(sd_sil),     # average SD across both datasets
+    .groups = "drop"
+  ) %>%
+  # Normalise both metrics to [0,1] so they are on the same scale
+  mutate(
+    norm_mean = (combined_mean - min(combined_mean)) /
+                (max(combined_mean) - min(combined_mean)),
+    norm_sd   = 1 - (combined_sd - min(combined_sd)) /
+                    (max(combined_sd) - min(combined_sd)),  # lower SD = better
+    # Stability score: equal weight on high mean and low SD
+    stability_score = 0.5 * norm_mean + 0.5 * norm_sd
+  )
+
+cat("Stability scores per k (higher = better combination of mean and consistency):\n")
+print(k_stability[, c("k", "combined_mean", "combined_sd", "stability_score")])
+
+K <- k_stability$k[which.max(k_stability$stability_score)]
+
+# Also compute the individual best k per dataset (by mean only) for reporting
+best_k_cleaned      <- k_summary %>%
+  filter(dataset == "Cleaned") %>%
+  slice_max(mean_sil, n = 1) %>%
+  pull(k)
+
+best_k_preprocessed <- k_summary %>%
+  filter(dataset == "Preprocessed") %>%
+  slice_max(mean_sil, n = 1) %>%
+  pull(k)
+
+cat("\nOptimal k by mean only — Cleaned:     ", best_k_cleaned, "\n")
+cat("Optimal k by mean only — Preprocessed:", best_k_preprocessed, "\n")
+cat("\nShared k selected by stability score: k =", K, "\n")
+cat("We use k =", K, "for the main bootstrap.\n")
+```
+
+```{r k-decision-note, echo=FALSE}
+if (K == best_k_cleaned && K == best_k_preprocessed) {
+  cat("Note: The stability-based selection agrees with the mean-based selection for",
+      "both datasets. This makes the choice of k =", K, "particularly well justified.\n")
+} else if (K == best_k_cleaned || K == best_k_preprocessed) {
+  cat("Note: The stability-based selection agrees with the mean-based selection for",
+      "one of the two datasets.\n",
+      "For the main bootstrap we use k =", K,
+      "because it offers the best combination of high mean silhouette and low",
+      "variability across both datasets.\n")
+} else {
+  cat("Note: The stability-based k =", K,
+      "differs from what a pure mean comparison would suggest",
+      "(k =", best_k_cleaned, "for Cleaned, k =", best_k_preprocessed, "for Preprocessed).",
+      "\nThis illustrates exactly the problem our professor pointed out: simply picking",
+      "the k with the highest mean can be misleading if that k also has high variability.",
+      "\nWe therefore prefer k =", K,
+      "because it provides a more consistent and reliable clustering solution.\n")
+}
+```
+
+### Interpretation of the k-Selection Step
+
+The selection of k was not based solely on the highest average silhouette width.
+Instead, we considered both the level (how high the silhouette scores were on average)
+and the consistency (how much the scores varied across bootstrap repetitions) for each
+candidate k. This approach is more informative because a k that produces highly variable
+results is less trustworthy, even if it happens to have the highest mean in a given set
+of pilot runs.
+
+The boxplots and confidence intervals showed that some k values are considerably more
+stable than others. Based on this distributional assessment, we selected **k = `r K`**
+as the shared value for both datasets. This choice reflects a reasonable trade-off
+between clustering quality and stability, and it will be used for both the stability
+analysis and the main bootstrap in the steps that follow.
+
+> **A note on the separation of concerns:** The distributional analysis above is
+> specifically about choosing k. It answers the question: "For which k do we get the
+> most reliable and consistent clustering signal?" The question of how many bootstrap
+> repetitions (B) to use in the main analysis is a separate matter, addressed in
+> Step 5. These two questions are related in that both involve bootstrap resampling, but
+> they should not be conflated — one is about the cluster structure, the other is about
+> the stability of our estimation procedure.
+
+
+
+# Step 4: Helper Function for the Bootstrap
+
+```{r bootstrap-function}
+run_bootstrap <- function(B, sample_n, k, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+
+  sil_c <- numeric(B)
+  sil_p <- numeric(B)
+
+  for (i in 1:B) {
+
+    # ONE set of row indices for BOTH datasets — same persons, only preprocessing differs.
+    idx <- sample(nrow(cleaned_typed), size = sample_n, replace = TRUE)
+
+    sample_c <- cleaned_typed[idx, ]
+    sample_p <- preprocessed_typed[idx, ]
+
+    gower_c <- daisy(sample_c, metric = "gower")
+    gower_p <- daisy(sample_p, metric = "gower")
+
+    pam_c <- pam(gower_c, k = k, diss = TRUE)
+    pam_p <- pam(gower_p, k = k, diss = TRUE)
+
+    sil_c[i] <- mean(silhouette(pam_c$clustering, gower_c)[, 3])
+    sil_p[i] <- mean(silhouette(pam_p$clustering, gower_p)[, 3])
+  }
+
+  list(cleaned = sil_c, preprocessed = sil_p)
+}
+```
+
+
+
+# Step 5: Stability Analysis Across Different B Values
+
+We run the bootstrap for B = `r paste(B_values, collapse = ", ")`. For each B we
+record the mean silhouette scores, the difference, and the Wilcoxon p-value. If these
+stay consistent as B grows, the result is stable and does not depend on the specific
+number of repetitions chosen.
+
+```{r stability-analysis, cache=TRUE}
+stability_rows <- list()
+
+for (b in B_values) {
+  cat("Running bootstrap with B =", b, "...\n")
+
+  res <- run_bootstrap(B = b, sample_n = SAMPLE_N, k = K, seed = 42)
+
+  wt <- wilcox.test(res$preprocessed, res$cleaned,
+                    paired = TRUE, alternative = "two.sided")
+
+  stability_rows[[as.character(b)]] <- data.frame(
+    B           = b,
+    Mean_C      = round(mean(res$cleaned),                          4),
+    Mean_P      = round(mean(res$preprocessed),                     4),
+    Difference  = round(mean(res$preprocessed) - mean(res$cleaned), 4),
+    Wilcoxon_p  = round(wt$p.value,                                 4),
+    Significant = ifelse(wt$p.value < 0.05, "Yes", "No")
+  )
+}
+
+stability_df <- do.call(rbind, stability_rows)
+rownames(stability_df) <- NULL
+cat("\nStability analysis complete.\n")
+```
+
+```{r stability-table}
+knitr::kable(stability_df,
+             col.names = c("B", "Mean Sil. (Cleaned)", "Mean Sil. (Preprocessed)",
+                           "Difference", "Wilcoxon p", "Significant (p < 0.05)"),
+             caption   = paste0("Stability of Results Across Different B Values",
+                                " (sample size = ", SAMPLE_N, ", k = ", K, ")"))
+```
+
+```{r stability-interpretation, echo=FALSE}
+diffs <- stability_df$Difference
+sigs  <- stability_df$Significant
+n_pos <- sum(diffs > 0)
+n_sig <- sum(sigs == "Yes")
+
+if (n_pos == nrow(stability_df)) {
+  cat("The preprocessed dataset scores HIGHER in ALL", nrow(stability_df),
+      "tested B values.\n")
+} else if (n_pos == 0) {
+  cat("The cleaned dataset scores HIGHER in ALL", nrow(stability_df),
+      "tested B values.\n")
+} else {
+  cat("The direction of the difference changes across B values.",
+      "Results are NOT stable.\n")
+}
+
+if (n_sig == nrow(stability_df)) {
+  cat("Statistically significant (p < 0.05) for ALL tested B values.\n")
+} else if (n_sig == 0) {
+  cat("NOT statistically significant for any tested B value.\n")
+} else {
+  cat("Significant for", n_sig, "out of", nrow(stability_df), "B values.\n")
+}
+
+cat("\nConclusion:",
+    ifelse(n_pos == nrow(stability_df) | n_pos == 0,
+           "The finding is STABLE across different B values.",
+           "The finding is NOT stable — more investigation needed."), "\n")
+```
+
+```{r stability-plot, fig.width=9, fig.height=5}
+stability_long <- stability_df %>%
+  select(B, Mean_C, Mean_P) %>%
+  pivot_longer(cols = c(Mean_C, Mean_P),
+               names_to  = "Dataset",
+               values_to = "Mean_Sil") %>%
+  mutate(Dataset = recode(Dataset, "Mean_C" = "Cleaned", "Mean_P" = "Preprocessed"))
+
+ggplot(stability_long, aes(x = B, y = Mean_Sil, color = Dataset, group = Dataset)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_color_manual(values = dataset_colors) +
+  scale_x_continuous(breaks = B_values) +
+  labs(
+    title    = "Stability of Mean Silhouette Score Across B Values",
+    subtitle = "Lines that flatten out as B grows indicate a stable result",
+    x        = "Number of Bootstrap Repetitions (B)",
+    y        = "Mean Average Silhouette Width",
+    color    = "Dataset"
+  ) +
+  theme_minimal()
+```
+
+> **How to read this plot:** If the two lines stop changing as B increases from left
+> to right, the bootstrap estimates have "settled". Stability from B = 100 onwards
+> already suggests that the main result at B = `r B_main` is reliable.
+
+
+
+# Step 6: Main Bootstrap at B = `r B_main`
+
+```{r main-bootstrap, cache=TRUE}
+cat("Running main bootstrap with B =", B_main, "...\n")
+main_res <- run_bootstrap(B = B_main, sample_n = SAMPLE_N, k = K, seed = 42)
+
+sil_scores_cleaned      <- main_res$cleaned
+sil_scores_preprocessed <- main_res$preprocessed
+
+cat("Main bootstrap complete.\n")
+```
+
+
+
+# Step 7: Summary Statistics
+
+```{r summary-stats}
+summary_table <- data.frame(
+  Statistic = c("Mean", "Median", "SD", "Min", "Max"),
+  Cleaned = c(
+    round(mean(sil_scores_cleaned),   4),
+    round(median(sil_scores_cleaned), 4),
+    round(sd(sil_scores_cleaned),     4),
+    round(min(sil_scores_cleaned),    4),
+    round(max(sil_scores_cleaned),    4)
+  ),
+  Preprocessed = c(
+    round(mean(sil_scores_preprocessed),   4),
+    round(median(sil_scores_preprocessed), 4),
+    round(sd(sil_scores_preprocessed),     4),
+    round(min(sil_scores_preprocessed),    4),
+    round(max(sil_scores_preprocessed),    4)
+  )
+)
+
+knitr::kable(summary_table,
+             caption = paste0("Bootstrap Silhouette Scores (B=", B_main,
+                              ", sample size=", SAMPLE_N, ", k=", K, ")"))
+```
+## Interpretation
+
+The summary statistics indicate that both datasets yield highly stable clustering
+results across the `r B_main` bootstrap repetitions: the standard deviations are small
+relative to the respective means, confirming that the silhouette estimates do not
+fluctuate substantially from one bootstrap sample to the next. This stability is a
+necessary condition for treating the comparison between datasets as meaningful rather
+than artefactual.
+
+Comparing the two datasets, the cleaned dataset exhibits slightly higher mean and median
+silhouette scores. In substantive terms, this means that observations in the cleaned
+data tend, on average, to be more distinctly assigned to their own cluster — that is,
+they are closer to the other members of their cluster and further from the nearest
+alternative cluster. The preprocessed dataset's scores are marginally lower, suggesting
+that the additional preprocessing steps may not have sharpened the cluster structure
+and could, in some respects, have introduced noise into the distance calculations.
+
+It is important to note that the magnitude of the difference is small. Summary
+statistics alone cannot determine whether this gap reflects a genuine structural
+difference or simply sampling variability. That question is addressed formally in
+Step 8 through the paired Wilcoxon signed-rank test.
+
+
+
+# Step 8: Statistical Test
+
+We use a **paired Wilcoxon signed-rank test** to check whether the difference in
+silhouette scores is statistically significant.
+
+> **Why paired?** Each run $i$ produced one score per dataset from the same bootstrap
+> sample. The B pairs of scores are linked by design.
+
+> **Why Wilcoxon and not a t-test?** Silhouette scores may not be normally distributed.
+> The Wilcoxon test is a non-parametric alternative that makes no such assumption.
+
+H0: no difference in median silhouette score between the two datasets. If p < 0.05, we
+reject H0.
+
+```{r wilcoxon-test}
+wilcox_result <- wilcox.test(sil_scores_preprocessed, sil_scores_cleaned,
+                              paired = TRUE, alternative = "two.sided")
+print(wilcox_result)
+```
+
+```{r interpret-test, echo=FALSE}
+if (wilcox_result$p.value < 0.05) {
+  if (mean(sil_scores_preprocessed) > mean(sil_scores_cleaned)) {
+    cat("The difference IS statistically significant (p < 0.05).\n")
+    cat("The preprocessed dataset shows HIGHER silhouette scores on average.\n")
+    cat("This suggests that preprocessing IMPROVES clustering quality.\n")
+  } else {
+    cat("The difference IS statistically significant (p < 0.05).\n")
+    cat("The cleaned dataset shows HIGHER silhouette scores on average.\n")
+    cat("This suggests that preprocessing does NOT improve clustering quality.\n")
+  }
+} else {
+  cat("The difference is NOT statistically significant (p >= 0.05).\n")
+  cat("We cannot conclude that preprocessing changes clustering quality.\n")
+}
+```
+
+
+
+# Step 9: Visualising the Final Bootstrap Results
+
+## Purpose and Distinction from Earlier Visualisations
+
+It is important to clarify why this step is not redundant relative to the boxplots and
+confidence interval plots produced during k-selection in Step 3. Those earlier
+visualisations served a fundamentally different purpose: they compared the *distribution
+of silhouette scores across candidate values of k* (from 2 to 8) on relatively small
+pilot samples, and were used to identify which cluster count offered the best
+combination of quality and consistency. They said nothing about which dataset — cleaned
+or preprocessed — produces better clustering under the chosen k.
+
+The visualisations in this step address a different and more central research question:
+**given the shared k selected in Step 3, does the preprocessing step improve the
+clustering quality of the data?** For this comparison, the full main bootstrap
+(B = `r B_main`, sample size = `r SAMPLE_N`) is used, which provides a substantially
+larger and more reliable set of silhouette scores than the pilot runs. The two steps
+are therefore methodologically complementary: Step 3 determines the analytical
+conditions; Step 9 evaluates the outcome under those conditions.
+
+```{r prepare-plot-data, echo=FALSE}
+results_df <- data.frame(
+  run       = rep(1:B_main, 2),
+  sil_score = c(sil_scores_cleaned, sil_scores_preprocessed),
+  dataset   = rep(c("Cleaned", "Preprocessed"), each = B_main)
+)
+```
+
+## Boxplot: Overall Distribution of Silhouette Scores
+
+The boxplot below provides a compact summary of the entire bootstrap distribution for
+each dataset. Each box is based on `r B_main` silhouette scores, one per bootstrap run,
+and conveys four key pieces of information simultaneously: the median (central
+tendency), the interquartile range (spread of the middle 50 % of observations), the
+whiskers (range excluding outliers), and individual outlying runs.
+
+```{r boxplot, fig.width=7, fig.height=5}
+ggplot(results_df, aes(x = dataset, y = sil_score, fill = dataset)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21, outlier.size = 1.5) +
+  scale_fill_manual(values = dataset_colors) +
+  labs(
+    title    = paste0("Bootstrap Silhouette Scores: Cleaned vs. Preprocessed",
+                      " (B=", B_main, ", n=", SAMPLE_N, ", k=", K, ")"),
+    subtitle = "Each box summarises the full distribution across all bootstrap runs",
+    x        = "Dataset",
+    y        = "Average Silhouette Width"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+### Interpretation
+
+The boxplot reveals that both datasets produce silhouette scores within a similar and
+narrow range, which indicates that the bootstrap results are highly stable regardless
+of which subsample was drawn. The small interquartile ranges confirm that the clustering
+quality is consistent across repetitions rather than dominated by a few lucky or unlucky
+samples.
+
+Comparing the two distributions, the cleaned dataset shows a slightly higher median
+silhouette width and a similarly compact spread. This suggests that, on average, the
+clusters produced from the cleaned data are marginally better separated — that is,
+observations tend to sit more clearly within their assigned cluster and at a greater
+distance from the nearest alternative cluster. However, the degree of overlap between
+the two boxes indicates that this advantage is modest. The substantive significance of
+this difference depends on the statistical test conducted in Step 8: if the Wilcoxon
+signed-rank test yields a significant result, the observed shift in medians can be
+attributed to preprocessing rather than to random sampling variation.
+
+
+## Overlapping Histograms: Shape of the Score Distributions
+
+While the boxplot captures summary statistics efficiently, it can obscure fine-grained
+features of the distribution such as skewness, multimodality, or the precise degree of
+overlap between the two groups. The histogram below addresses this by showing the full
+frequency distribution of silhouette scores for both datasets simultaneously.
+
+```{r histograms, fig.width=9, fig.height=5}
+ggplot(results_df, aes(x = sil_score, fill = dataset)) +
+  geom_histogram(alpha = 0.5, bins = 30, position = "identity") +
+  scale_fill_manual(values = dataset_colors) +
+  labs(
+    title    = "Frequency Distribution of Bootstrap Silhouette Scores",
+    subtitle = paste0("Overlapping bars show the degree of similarity between datasets",
+                      " across ", B_main, " bootstrap runs"),
+    x        = "Average Silhouette Width",
+    y        = "Frequency",
+    fill     = "Dataset"
+  ) +
+  theme_minimal()
+```
+
+### Interpretation
+
+The histogram confirms and extends the impression from the boxplot. Both distributions
+appear approximately bell-shaped and unimodal, with no evidence of bimodality or
+extreme skewness. This is consistent with the Central Limit Theorem: averaging
+silhouette scores across `r SAMPLE_N` observations in each bootstrap run naturally
+pushes the distribution of means towards normality.
+
+The centre of the cleaned dataset's distribution is shifted slightly to the right
+relative to the preprocessed dataset, in line with the higher median observed in the
+boxplot. Importantly, the two distributions overlap substantially. This visual overlap
+is not a contradiction of the Wilcoxon test result: even small but systematic shifts in
+location can be statistically significant when they are replicated consistently across
+`r B_main` paired observations. The histogram therefore reinforces that the difference,
+while statistically detectable, is small in absolute terms.
+
+
+## Run-by-Run Line Plot: Within-Run Consistency
+
+The two plots above describe the marginal distributions of silhouette scores, but do
+not show whether the cleaned dataset outperformed the preprocessed dataset within
+individual bootstrap runs — that is, on a paired basis. The line plot below displays
+the silhouette score for each of the `r B_main` bootstrap runs separately, allowing
+the within-run relationship between the two datasets to be inspected directly.
+
+```{r lineplot, fig.width=10, fig.height=5}
+ggplot(results_df, aes(x = run, y = sil_score, color = dataset)) +
+  geom_line(alpha = 0.6, linewidth = 0.5) +
+  scale_color_manual(values = dataset_colors) +
+  labs(
+    title    = paste0("Per-Run Silhouette Scores Across All Bootstrap Iterations",
+                      " (B=", B_main, ")"),
+    subtitle = paste0("Each run uses identical row indices for both datasets; ",
+                      "persistent separation indicates a systematic effect of preprocessing"),
+    x        = "Bootstrap Run",
+    y        = "Average Silhouette Width",
+    color    = "Dataset"
+  ) +
+  theme_minimal()
+```
+
+### Interpretation
+
+The run-by-run line plot is particularly informative in the context of a paired
+bootstrap design. Because both datasets are clustered on exactly the same persons in
+each run, any run in which one line lies above the other constitutes direct within-run
+evidence that one dataset produced better-separated clusters for those specific
+individuals.
+
+If the two lines were interleaved at random — crossing frequently with no consistent
+pattern — it would suggest that the observed difference in means is largely driven by
+chance variation across samples. Conversely, if one line consistently lies above the
+other across most or all runs, it provides strong evidence of a systematic advantage
+that cannot be attributed to sampling noise alone.
+
+The plot also allows visual confirmation of the stability already reported in Step 5:
+lines that remain horizontal and parallel across all runs indicate that the main
+bootstrap estimates have converged and are not driven by a small number of exceptional
+iterations. Taken together with the Wilcoxon test, this run-by-run perspective
+strengthens — or qualifies — the overall conclusion about the effect of preprocessing
+on clustering quality.
+
+
+## Mean Silhouette Width with 95% Bootstrap Confidence Intervals
+
+The three visualisations above characterise the *distribution* of bootstrap silhouette
+scores. However, from an inferential standpoint, the quantity of primary interest is
+the *mean* silhouette width for each dataset and the uncertainty surrounding that
+estimate. The plot below makes this explicit by displaying the mean silhouette width for
+each dataset alongside a 95% bootstrap confidence interval, computed directly from the
+`r B_main` bootstrap scores using the percentile method.
+
+This plot is conceptually distinct from the confidence interval plot in Step 3. There,
+CIs were computed across only `r K_REPS` pilot repetitions of size `r PILOT_N` for
+each candidate k, and their purpose was to support k-selection. Here, the CIs are
+derived from the full main bootstrap (B = `r B_main`, sample size = `r SAMPLE_N`) at
+the single fixed k = `r K`, and their purpose is to quantify the precision of the final
+mean estimates and to make the comparison between datasets visually unambiguous.
+
+```{r ci-plot-final, fig.width=6, fig.height=5}
+# Compute means and 95% percentile-based bootstrap CIs from the main bootstrap scores
+ci_df <- results_df %>%
+  group_by(dataset) %>%
+  summarise(
+    mean_sil = mean(sil_score),
+    ci_lower = quantile(sil_score, 0.025),
+    ci_upper = quantile(sil_score, 0.975),
+    .groups  = "drop"
+  )
+
+ggplot(ci_df, aes(x = dataset, y = mean_sil, colour = dataset)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                width = 0.15, linewidth = 0.9) +
+  scale_colour_manual(values = dataset_colors) +
+  labs(
+    title    = paste0("Mean Silhouette Width with 95% Bootstrap CI",
+                      " (B=", B_main, ", n=", SAMPLE_N, ", k=", K, ")"),
+    subtitle = "CI computed via the percentile method from the main bootstrap scores",
+    x        = "Dataset",
+    y        = "Mean Average Silhouette Width"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+### Interpretation
+
+The confidence intervals convey two pieces of information simultaneously: the vertical
+position of each point shows which dataset achieves the higher mean silhouette width,
+and the length of each error bar reflects how precisely that mean has been estimated
+from the `r B_main` bootstrap repetitions. Narrow error bars — which are expected here
+given the large B and the stability already confirmed in Step 5 — indicate that
+additional bootstrap repetitions would not materially change the estimated means.
+
+The critical question for interpretation is whether the two confidence intervals
+overlap. **Non-overlapping intervals** would provide clear visual evidence that the
+two means are distinguishable at approximately the 95% confidence level, strongly
+supporting the conclusion that preprocessing has a detectable effect on clustering
+quality. **Overlapping intervals** would suggest that, despite any numerical difference
+in the means, the uncertainty in the estimates is large enough that the two datasets
+cannot be ranked with confidence on visual grounds alone — in which case the formal
+Wilcoxon test result in Step 8 becomes the primary basis for inference.
+
+Note that the percentile-based CI shown here describes the variability of the
+*bootstrap sampling distribution* of the mean, not the variability of individual
+silhouette scores across runs (which is what the boxplot captures). The two plots
+therefore complement rather than duplicate each other: the boxplot shows the spread of
+individual run-level scores, while this CI plot focuses on the precision of the
+estimated mean — the summary statistic that is ultimately compared between datasets.
+
+# Conclusion
+
+This analysis compared clustering quality between the cleaned and preprocessed dataset
+using a **bootstrap procedure with PAM and Gower distance**. The analysis proceeded in
+three methodologically distinct stages, each addressing a different question.
+
+**1. Choosing k (Step 3).** We evaluated k = `r min(K_VALUES)` to `r max(K_VALUES)`
+for both datasets using **paired pilot samples** — the same row indices were applied to
+both datasets in every repetition. Crucially, k was not selected simply by identifying
+the value with the highest average silhouette width, as this approach can be misleading
+when one k produces a marginally higher mean but at the cost of substantially greater
+variability. Instead, we examined the **full distribution** of silhouette scores across
+all `r K_REPS` pilot repetitions for each k, using both boxplots and 95% bootstrap
+confidence intervals. This distributional perspective allowed us to assess not only the
+level but also the *consistency* of clustering quality for each candidate k. The shared
+**k = `r K`** was selected because it offered the best combination of a reasonably high
+mean silhouette width and low across-repetition variability for both datasets.
+
+**2. Stability of the estimation procedure (Step 5).** Before committing to B = `r B_main`,
+we ran the bootstrap for B = `r paste(B_values, collapse = ", ")` to verify that the
+estimated mean silhouette scores and the direction of the difference between datasets
+do not change materially as B increases. This is a separate concern from k-selection:
+it asks not which cluster structure fits the data best, but whether our estimation
+procedure has converged to a stable answer. Consistent means, consistent differences,
+and consistent Wilcoxon p-values across all tested B values confirm that the main
+result is not an artefact of the number of repetitions chosen.
+
+**3. Main comparative analysis at B = `r B_main` (Steps 6–9).** In every bootstrap
+run, the **same row indices** were applied to both datasets. Because both datasets
+contain the same individuals in the same row order, any consistent difference in
+silhouette scores across runs can be attributed to the preprocessing itself rather than
+to which persons happened to be sampled. The final visualisations in Step 9 — which examine the marginal distributions (boxplot
+and histogram), the within-run paired differences (line plot), and the precision of the
+estimated means (95% bootstrap confidence interval plot) — together confirmed whether
+the cleaned or preprocessed dataset produces more consistently well-separated clusters
+under these controlled conditions.
+
+```{r final-summary, echo=FALSE}
+diff_mean <- round(mean(sil_scores_preprocessed) - mean(sil_scores_cleaned), 4)
+direction <- ifelse(diff_mean > 0, "higher", "lower")
+
+cat("Optimal k by stability — Shared k:     ", K, "\n")
+cat("(k by mean only — Cleaned:             ", best_k_cleaned, ")\n")
+cat("(k by mean only — Preprocessed:        ", best_k_preprocessed, ")\n\n")
+cat("Mean silhouette — Cleaned:     ", round(mean(sil_scores_cleaned),      4), "\n")
+cat("Mean silhouette — Preprocessed:", round(mean(sil_scores_preprocessed), 4), "\n")
+cat("Difference (Pre - Cleaned):    ", diff_mean, "\n")
+cat("The preprocessed dataset scored", direction, "on average.\n")
+cat("Wilcoxon p-value:              ", round(wilcox_result$p.value, 4), "\n")
+```
+
+
+
+# Step 10: MDS Visualisation of the Final Cluster Solution
+
+## What is MDS and Why Is It Used Here?
+
+Multidimensional Scaling (MDS) is a dimensionality reduction technique that projects
+high-dimensional distance information into a low-dimensional space — in our case, two
+dimensions — so that the relative distances between observations are preserved as
+faithfully as possible. Points that are close together in the MDS plot were also close
+together in the original Gower distance matrix; points that are far apart were
+dissimilar in the original high-dimensional space.
+
+Because our clustering is based on a **Gower distance matrix** (not raw coordinates),
+MDS is the natural visualisation choice: it works directly with the distance matrix
+and does not require any assumption about the underlying variable space. This makes it
+especially well suited for mixed-type survey data where standard dimensionality
+reduction methods such as PCA are not directly applicable.
+
+The MDS plots below are based on **one representative bootstrap sample** — specifically
+the last sample drawn during the main bootstrap. This sample has size `r SAMPLE_N`
+and was clustered with k = `r K`. The same sample is used for both datasets so that
+the two plots can be compared directly.
+
+> **Note on interpretation:** MDS in two dimensions inevitably involves some loss of
+> information — not all pairwise distances can be represented perfectly in 2D. The
+> **stress value** (printed below each plot) quantifies this loss: lower stress means a
+> better-fitting 2D representation. As a rule of thumb, stress below 0.10 is
+> considered a good fit, and below 0.20 an acceptable fit.
+
+```{r mds-data-prep}
+# Reproduce the last bootstrap sample using the same seed and iteration logic.
+# We fix a single sample for the MDS plots so both datasets use identical persons.
+set.seed(42 + B_main)  # deterministic but distinct from the main bootstrap seed
+idx_mds <- sample(nrow(cleaned_typed), size = SAMPLE_N, replace = TRUE)
+
+sample_mds_c <- cleaned_typed[idx_mds, ]
+sample_mds_p <- preprocessed_typed[idx_mds, ]
+
+# Compute Gower distance matrices
+gower_mds_c <- daisy(sample_mds_c, metric = "gower")
+gower_mds_p <- daisy(sample_mds_p, metric = "gower")
+
+# Run PAM with the chosen k
+pam_mds_c <- pam(gower_mds_c, k = K, diss = TRUE)
+pam_mds_p <- pam(gower_mds_p, k = K, diss = TRUE)
+
+# Compute MDS coordinates (classical/metric MDS)
+mds_c <- cmdscale(gower_mds_c, k = 2, eig = TRUE)
+mds_p <- cmdscale(gower_mds_p, k = 2, eig = TRUE)
+
+# Stress: proportion of variance NOT explained by the 2D solution
+# (using the GOF statistic returned by cmdscale: 1 - GOF gives residual)
+stress_c <- round(1 - mds_c$GOF[1], 3)
+stress_p <- round(1 - mds_p$GOF[1], 3)
+
+cat("MDS stress (Cleaned):     ", stress_c, "\n")
+cat("MDS stress (Preprocessed):", stress_p, "\n")
+
+# Build plotting data frames
+mds_df_c <- data.frame(
+  Dim1    = mds_c$points[, 1],
+  Dim2    = mds_c$points[, 2],
+  Cluster = factor(pam_mds_c$clustering)
+)
+
+mds_df_p <- data.frame(
+  Dim1    = mds_p$points[, 1],
+  Dim2    = mds_p$points[, 2],
+  Cluster = factor(pam_mds_p$clustering)
+)
+
+# Mark medoids in each data frame
+mds_df_c$Medoid <- FALSE
+mds_df_c$Medoid[pam_mds_c$id.med] <- TRUE
+
+mds_df_p$Medoid <- FALSE
+mds_df_p$Medoid[pam_mds_p$id.med] <- TRUE
+```
+
+## MDS Plot: Cleaned Dataset
+
+```{r mds-plot-cleaned, fig.width=8, fig.height=6}
+ggplot(mds_df_c, aes(x = Dim1, y = Dim2, colour = Cluster)) +
+  geom_point(alpha = 0.55, size = 1.8) +
+  geom_point(
+    data   = subset(mds_df_c, Medoid),
+    shape  = 8, size = 5, stroke = 1.5,
+    colour = "black", show.legend = FALSE
+  ) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(
+    title    = paste0("MDS of Gower Distance — Cleaned Dataset (k = ", K, ")"),
+    subtitle = paste0("n = ", SAMPLE_N, "  |  Stress = ", stress_c,
+                      "  |  ★ = cluster medoid"),
+    x        = "MDS Dimension 1",
+    y        = "MDS Dimension 2",
+    colour   = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+## MDS Plot: Preprocessed Dataset
+
+```{r mds-plot-preprocessed, fig.width=8, fig.height=6}
+ggplot(mds_df_p, aes(x = Dim1, y = Dim2, colour = Cluster)) +
+  geom_point(alpha = 0.55, size = 1.8) +
+  geom_point(
+    data   = subset(mds_df_p, Medoid),
+    shape  = 8, size = 5, stroke = 1.5,
+    colour = "black", show.legend = FALSE
+  ) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(
+    title    = paste0("MDS of Gower Distance — Preprocessed Dataset (k = ", K, ")"),
+    subtitle = paste0("n = ", SAMPLE_N, "  |  Stress = ", stress_p,
+                      "  |  ★ = cluster medoid"),
+    x        = "MDS Dimension 1",
+    y        = "MDS Dimension 2",
+    colour   = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+## Side-by-Side Comparison
+
+```{r mds-combined, fig.width=14, fig.height=6}
+mds_df_c$Dataset <- "Cleaned"
+mds_df_p$Dataset <- "Preprocessed"
+mds_combined     <- rbind(mds_df_c, mds_df_p)
+
+stress_labels <- c(
+  Cleaned      = paste0("Cleaned (stress = ",      stress_c, ")"),
+  Preprocessed = paste0("Preprocessed (stress = ", stress_p, ")")
+)
+
+ggplot(mds_combined, aes(x = Dim1, y = Dim2, colour = Cluster)) +
+  geom_point(alpha = 0.50, size = 1.5) +
+  geom_point(
+    data    = subset(mds_combined, Medoid),
+    shape   = 8, size = 5, stroke = 1.5,
+    colour  = "black", show.legend = FALSE
+  ) +
+  scale_colour_brewer(palette = "Set2") +
+  facet_wrap(~ Dataset, labeller = labeller(Dataset = stress_labels)) +
+  labs(
+    title    = paste0("MDS Cluster Visualisation — Side-by-Side Comparison (k = ", K, ")"),
+    subtitle = paste0("Same ", SAMPLE_N,
+                      " individuals in both panels  |  ★ = cluster medoid"),
+    x        = "MDS Dimension 1",
+    y        = "MDS Dimension 2",
+    colour   = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Silhouette Plot per Cluster
+
+To complement the spatial MDS view, the silhouette plots below show how well each
+individual observation fits its assigned cluster. Each horizontal bar represents one
+observation; its length equals the silhouette width (ranging from −1 to +1). Bars are
+grouped by cluster and sorted within each cluster from highest to lowest silhouette
+width. A **tall, uniformly positive bar group** indicates a compact and well-separated
+cluster; bars that dip below zero signal observations that may be mis-assigned.
+
+```{r silhouette-plots, fig.width=10, fig.height=5}
+sil_c_obj <- silhouette(pam_mds_c$clustering, gower_mds_c)
+sil_p_obj <- silhouette(pam_mds_p$clustering, gower_mds_p)
+
+par(mfrow = c(1, 2))
+
+plot(sil_c_obj,
+     main   = paste0("Silhouette — Cleaned (k = ", K, ")"),
+     col    = RColorBrewer::brewer.pal(K, "Set2"),
+     border = NA)
+
+plot(sil_p_obj,
+     main   = paste0("Silhouette — Preprocessed (k = ", K, ")"),
+     col    = RColorBrewer::brewer.pal(K, "Set2"),
+     border = NA)
+
+par(mfrow = c(1, 1))
+```
+
+## Interpretation of the MDS Visualisation
+
+### What the MDS Axes Represent
+
+The two MDS axes (Dimension 1 and Dimension 2) do **not** correspond to any single
+original variable. They are mathematical constructs chosen to capture as much of the
+pairwise Gower distance information as possible in two dimensions. Dimension 1
+typically captures the largest source of variation in the distance matrix (i.e., the
+dimension along which observations differ the most), and Dimension 2 captures the
+second-largest. Observations that are far apart along Dimension 1 are very different
+from each other in terms of the overall Gower distance structure; observations that are
+close along both axes are highly similar across all variables.
+
+### How to Read the Cluster Structure
+
+**Compact, clearly separated point clouds** — where each colour forms a tight group
+with visible empty space between the groups — indicate high cluster quality. This
+pattern is consistent with high silhouette widths because well-separated clusters in
+the Gower space remain well-separated when projected into 2D.
+
+**Overlapping or diffuse point clouds** — where colours mix together — signal that the
+clusters are not easily distinguishable, either because the original distance structure
+is genuinely ambiguous or because some information is lost in the 2D projection (which
+is captured by the stress value).
+
+### Role of the Medoids
+
+The black star markers (★) identify the **medoid** of each cluster — the actual
+observation from the dataset that is most centrally located within its cluster, in the
+sense of minimising the average Gower distance to all other members. Unlike K-Means
+centroids, medoids are real respondents. They can therefore be inspected directly to
+understand what a "typical" member of each cluster looks like in terms of the original
+survey variables (e.g., their accessibility profile, family preferences, or media
+consumption perceptions).
+
+### Comparing the Two Datasets
+
+Because the same `r SAMPLE_N` individuals appear in both panels of the side-by-side
+plot, any visual difference in cluster separation can be attributed to the
+preprocessing rather than to different persons being compared. If the preprocessed
+panel shows more compact and better-separated clusters — or lower MDS stress — this is
+consistent with the higher mean silhouette scores observed throughout the bootstrap
+analysis and supports the conclusion that preprocessing improved the underlying
+clustering structure.
+
+Conversely, if the two panels look nearly identical, it suggests that the effect of
+preprocessing — while possibly statistically significant given the large number of
+bootstrap runs — may be small in practical terms and difficult to detect visually in a
+single sample.
+
+> **Summary:** The MDS plots translate the abstract silhouette scores into a concrete
+> spatial picture of the cluster solution. They do not replace the quantitative
+> bootstrap analysis, but they provide an intuitive and complementary way to assess
+> whether the clusters are meaningfully separated and whether preprocessing made a
+> visible difference to the structure of the data.
